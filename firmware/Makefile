@@ -1,4 +1,4 @@
-CC =  /opt/microchip/xc8/v1.34/bin/xc8
+CC =  /opt/microchip/xc8/bin/xc8
 MDB = /opt/microchip/mplabx/mplab_ide/bin/mdb.sh
 
 PK2CMD = /usr/local/bin/pk2cmd
@@ -21,15 +21,14 @@ $(EXEC): $(OBJS)
 
 all: $(EXEC)
 
-clean: 
+clean:
 	rm -f MPLABXLog.xml*
 	rm -f l.obj
 	rm -f funclist
 	rm -f prog.cmd
 	rm -f $(EXEC).*
 	rm -f startup.*
-	rm -f *.d *.p1 *.pre 
-	
+	rm -f *.d *.p1 *.pre
 
 
 pickit3: $(EXEC)
@@ -40,6 +39,5 @@ pickit3: $(EXEC)
 	echo "Quit" >> prog.cmd
 	$(MDB) prog.cmd
 
-pickit2:  
+pickit2:
 	$(PK2CMD) -M -PPIC16F1455 -F$(EXEC).hex -B$(PK2DEVPATH)
-
