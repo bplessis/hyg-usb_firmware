@@ -5,6 +5,10 @@
 #define LED_OFF		 0
 #define LED_AUTO	-1
 
+#define GREEN_LED       16
+#define YELLOW_LED       8
+#define RED_LED          4
+
 void setup_leds (  );
 
 void set_green_led ( unsigned );
