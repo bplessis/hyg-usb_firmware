@@ -1,9 +1,10 @@
 #include <xc.h>
 
+#include "types.h"
 #include "i2c.h"
 #include "si7021A10.h"
 
-signed char get_i2c_dword_at ( unsigned char addr, __DWORD * value ) {
+signed char get_i2c_dword_at ( unsigned char addr, __WORD * value ) {
         signed char ret;
         ret = 0;
 
@@ -40,10 +41,10 @@ signed char get_i2c_dword_at ( unsigned char addr, __DWORD * value ) {
         return ret;
 }
 
-signed char measure_rh ( __DWORD * value ) {
+signed char measure_rh ( __WORD * value ) {
         return get_i2c_dword_at ( 0xE5, value );
 }
 
-signed char measure_temp ( __DWORD * value ) {
-        return get_i2c_dword_at ( 0xE3, value );
+signed char measure_temp ( __WORD * value ) {
+        return get_i2c_dword_at ( 0xE0, value );
 }
