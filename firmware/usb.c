@@ -1,5 +1,6 @@
 #include <xc.h>
 #include <string.h>
+#include "types.h"
 #include "usb.h"
 #include "leds.h"
 #include "descriptors.h"
@@ -8,60 +9,51 @@
 #define UOWN		0x80    // USB Ownership Bit
 #define DTSEN		0x08    // Data Toggle Sync Enable
 #define DTS		0x40    // Data Toggle Sync
-#define BSTALL          0x04    // Buffer Stall
+#define BSTALL		0x04    // Buffer Stall
 
-typedef union {
-        struct {
-                unsigned bch:2;
-                unsigned bstall:1;
-                unsigned dtsen:1;
-                unsigned:2;
-                unsigned dts:1;
-                unsigned uown:1;
-        };
-        struct {
-                unsigned:2;
-                unsigned pid:4;
-                unsigned:2;
-        };
-        unsigned char value;
-} __BufferDescriptorStat;
-
-typedef union {
-        union {
-                struct {
-                        __BufferDescriptorStat STAT;
-                        unsigned char CNT;
-                        unsigned int ADDR;
-                };
-                struct {
-                        unsigned char Stat;
-                        unsigned char Cnt;
-                };
-        };
-        unsigned int v[2];
+typedef struct {
+	union {
+		struct {
+			/* When receiving from the SIE. (USB Mode) */
+			unsigned char bch : 2;
+			unsigned char pid : 4; /* See enum PID */
+			unsigned char reserved: 1;
+			unsigned char uown : 1;
+		};
+		struct {
+			/* When giving to the SIE (CPU Mode) */
+			unsigned char : 2;
+			unsigned char bstall : 1;
+			unsigned char dtsen : 1;
+			unsigned char : 2;
+			unsigned char dts : 1;
+			unsigned char /*UOWN*/ : 1;
+		};
+		unsigned char value;
+	} BDnSTAT;
+	unsigned char BDnCNT;
+	unsigned int BDnADR; /* BDnADRL and BDnADRH; */
 } __BufferDescriptor;
 
 typedef struct {
-        __BufferDescriptor Output;      // Host to Device
-        __BufferDescriptor Input;       // Device to Host
+	__BufferDescriptor Output;      // Host to Device
+	__BufferDescriptor Input;       // Device to Host
 } Interface;
 
 // USB SIE Memory Mapping start at 0x2000
 volatile __at ( 0x2000 )
 Interface Interfaces[2];
 
-// --- End Point 0
-volatile __at ( 0x203F )
-unsigned char EP0_OUTbuffer[8];
-volatile __at ( 0x2071 )
-unsigned char EP0_INbuffer[8];
+struct {
+	// --- End Point 0
+	unsigned char EP0_OUTbuffer[EP0_BUFLEN];
+	unsigned char EP0_INbuffer[EP0_BUFLEN];
 
-// --- End Point 1
-volatile __at ( 0x207B )
-unsigned char EP1_OUTbuffer[8];
-volatile __at ( 0x2084 )
-unsigned char EP1_INbuffer[8];
+	// --- End Point 1
+	unsigned char EP1_OUTbuffer[EP1_BUFLEN];
+	unsigned char EP1_INbuffer[EP1_BUFLEN];
+} ep_buffers __at ( 0x2080 );
+
 
 // Local data
 unsigned char *addr_to_send;
@@ -69,381 +61,465 @@ unsigned int cnt_to_send;
 
 unsigned char addresse;
 
-// Predecla
 
-void setup_endpoints (  );
+/* Convert a pointer, which can be a normal banked pointer or a linear
+ * pointer, to a linear pointer.
+ *
+ * The USB buffer descriptors need linear addresses. The XC8 compiler will
+ * generate banked (not linear) addresses for the arrays in ep_buffers if
+ * ep_buffers can fit within a single bank. This is good for code size, but
+ * the buffer descriptors cannot take banked addresses, so they must be
+ * generated from the banked addresses.
+ *
+ * See section 3.6.2 of the PIC16F1459 datasheet for details.
+ */
+static unsigned int pic16_linear_addr(void *ptr)
+{
+	unsigned char high, low;
+	unsigned int addr = (unsigned int) ptr;
 
-void setup_usb (  ) {
+	/* Addresses over 0x2000 are already linear addresses. */
+	if (addr >= 0x2000)
+		return addr;
 
-        UCFG = 0x10;            // Enable Pullups ; Low speed device ; no ping pong
-        UADDR = 0x00;           // Reset usb adress
-        UEIR = 0x00;            // Clear all usb error interrupts
+	high = (addr & 0xff00) >> 8;
+	low  = addr & 0x00ff;
 
-        addresse = 0x00;
-
-        // Reset PP buffers
-
-        do {
-                UCONbits.PPBRST = 1;
-                UCONbits.PPBRST = 0;
-
-        } while ( 0 );
-
-        // Enable Packet transfers
-
-        UCONbits.PKTDIS = 0;
-
-        // Enable USB module
-
-        if ( UCONbits.USBEN == 0 ) {
-                UCON = 0;
-                UIE = 0;
-                UCONbits.USBEN = 1;
-        }
-
-        while ( UCONbits.SE0 ) ;
-
-        UIR = 0;
-        UIE = 0;
-        UIEbits.URSTIE = 1;
-        UIEbits.IDLEIE = 1;
-
-        // Enable interrupts
-
-        UIE = 0x4B;             // Enable TRNIF, SOFIF, ERROR, RESET
-
-        INTCONbits.PEIE = 1;    // Enable Peripheral interrupts
-        INTCONbits.GIE = 1;     // General interrupt enabled
-        PIE2bits.USBIE = 1;     // USB interrupt enabled
-
-        // Setup endpoint buffers addresses
-        Interfaces[0].Output.ADDR = 0x203F;
-        Interfaces[0].Input.ADDR = 0x2071;
-        Interfaces[1].Output.ADDR = 0x207B;
-        Interfaces[1].Input.ADDR = 0x2084;
+	return 0x2000 +
+	       (low & 0x7f) - 0x20 +
+	       ((high << 1) + (low & 0x80)? 1: 0) * 0x50;
 }
+
+// Predecla
 
 void setup_endpoints (  ) {
 
-        UEP1 = 0x1E;
+	UCONbits.PPBRST = 1;	// Hold Ping Pong while setting up endpoints
 
-        Interfaces[1].Output.Cnt = 8;
-        Interfaces[1].Output.Stat = UOWN | DTSEN;
-        Interfaces[1].Input.Stat = 0x00;
+	// Reset Buffer Descriptors and re-init
+	memset(Interfaces, 0x0, sizeof(Interfaces));
+
+	// Setup endpoint buffers addresses
+	Interfaces[0].Output.BDnADR = PHYS_ADDR(ep_buffers.EP0_OUTbuffer);
+	Interfaces[0].Output.BDnCNT = EP0_BUFLEN;
+	Interfaces[0].Output.BDnSTAT.value = UOWN | DTSEN;
+
+	Interfaces[0].Input.BDnADR  = PHYS_ADDR(ep_buffers.EP0_INbuffer);
+	Interfaces[0].Input.BDnCNT = EP0_BUFLEN;
+	Interfaces[0].Input.BDnSTAT.value = 0x00;
+
+
+	Interfaces[1].Output.BDnADR = PHYS_ADDR(ep_buffers.EP1_OUTbuffer);
+	Interfaces[1].Output.BDnCNT = EP1_BUFLEN;
+	Interfaces[1].Output.BDnSTAT.value = UOWN | DTSEN;
+
+	Interfaces[1].Input.BDnADR  = PHYS_ADDR(ep_buffers.EP1_INbuffer);
+	Interfaces[1].Input.BDnCNT = EP1_BUFLEN;
+	Interfaces[1].Input.BDnSTAT.value = 0x00;
+
+	UCONbits.PPBRST = 0;	// Reactivate Ping Pong
 }
 
 void reset_usb (  ) {
 
-        UEIR = 0x00;
-        UIR = 0x00;
-        UEIE = 0x9f;
-        UIE = 0x7b;
-        UADDR = 0x00;
+#if defined(_USB_LOWSPEED)
+	UCFG = 0x10;            // Enable Pullups : Low speed device ; no ping pong
+#else
+	UCFG = 0x14;            // Enable Pullups : FS device ; no ping pong
+#endif
 
-        addresse = 0x00;
-        cnt_to_send = 0;
+	UADDR = 0x00;           // Reset usb address
 
-        UEP0 = 0x16;
+	UIE = 0;		// Reset USB Interrupts
+	UIE = 0b00101011;	// Enable interrupts
+	//UIEbits.URSTIE = 1;	// USB Reset Interrupt
+	//UIEbits.UERRIE = 1;	// USB Reset Interrupt
+	//UIEbits.TRNIE  = 1;	// USB Transaction Complete
+	//UIEbits.IDLEIE = 0;	// USB IDLE Detect Interrupt
+	//UIEbits.STALLIE= 1;	// USB STALL Handshake Interrupt
+	//UIEbits.SOFIE  = 0;	// USB Start Of Frame
 
-        UIRbits.TRNIF = 0;
-        UIRbits.TRNIF = 0;
-        UIRbits.TRNIF = 0;
-        UIRbits.TRNIF = 0;
+#if defined(_USB_ERROR_INTERRUPT)
+	UEIE = 0x9f;		// ErrorInterrupt: BTSEE | BTOEE | DFN8EE | CRC16EE | CRC5EE | PIDEE
+#else
+	UEIE = 0x00;		// USB Error Interrupt: disabled
+#endif
 
-        UCONbits.PKTDIS = 0;
+	/* If the PLL is being used, wait until the
+	   PLLRDY bit is set in the OSCSTAT register
+	   before attempting to set the USBEN bit. */
 
-        // WaitForPacket
+/*	if ( UCONbits.USBEN == 0 ) {
+		UCON = 0;
 
-        Interfaces[0].Output.Cnt = 8;
-        Interfaces[0].Output.Stat = UOWN | DTSEN;
+		while ( UCONbits.SE0 ) ;
+	}
+*/
 
-        Interfaces[0].Input.Stat = 0x00;
+	if ( OSCCONbits.SPLLEN ) {
+		while (!OSCSTATbits.PLLRDY)
+			NOP ( );
+	}
 
+	UCONbits.USBEN = 1;	// Enable USB module
+
+	addresse = 0x00;
+	cnt_to_send = 0;
+
+	// Empty FIFO
+	UIRbits.TRNIF = 0;
+	UIRbits.TRNIF = 0;
+	UIRbits.TRNIF = 0;
+	UIRbits.TRNIF = 0;
+
+	// Clear flags
+	UEIR = 0x00;		// Clear all usb error interrupts
+	UIR = 0x00;		// Clear all usb status interrupts
+
+	/* These are the UEP/U1EP endpoint management registers. */
+
+	/* Clear them all out. This is important because a bootloader
+	   could have set them to non-zero */
+	UEP0 = 0;UEP1 = 0; UEP2 = 0;UEP3 = 0;UEP4 = 0;UEP5 = 0;UEP6 = 0;UEP7 = 0;
+
+	// Setup Endpoints:
+	UEP0 = 0b00010110;
+	//UEP0bits.EPHSHK  = 1;	// Enable Handshake
+	//UEP0bits.EPOUTEN = 1;	// Outbound
+	//UEP0bits.EPINEN  = 1;	// Inbound
+
+	UEP1 = 0b00011110;
+	//UEP1bits.EPHSHK   = 1; // Enable Handshake
+	//UEP1bits.EPCONDIS = 1; // Enable control operations
+	//UEP1bits.EPOUTEN  = 1; // Outound
+	//UEP1bits.EPINEN   = 1; // Inbound
+
+	PIE2bits.USBIE = 1;      // USB interrupt enabled
+
+	// WaitForPacket
+
+	setup_endpoints ();
+
+	// Enable Packet transfers
+	UCONbits.PKTDIS = 0;
 }
 
 void fill_in_buffer (  ) {
 
-        unsigned int i;
-        unsigned int byte_count;
+	unsigned int i;
+	unsigned int byte_count;
 
-        if ( cnt_to_send < 8 )
-                byte_count = cnt_to_send;
-        else
-                byte_count = 8;
+	byte_count = (cnt_to_send < EP0_BUFLEN) ? cnt_to_send : EP0_BUFLEN;
 
-        Interfaces[0].Input.STAT.bch = 0;
-        Interfaces[0].Input.Cnt = byte_count;
+	Interfaces[0].Input.BDnSTAT.bch = 0;
+	Interfaces[0].Input.BDnCNT = byte_count;
 
-        for ( i = 0; i < byte_count; i++ )
-                EP0_INbuffer[i] = addr_to_send[i];
+	for ( i = 0; i < byte_count; i++ )
+		ep_buffers.EP0_INbuffer[i] = addr_to_send[i];
 
-        cnt_to_send -= byte_count;
-        addr_to_send += byte_count;
+	cnt_to_send -= byte_count;
+	addr_to_send += byte_count;
 
 }
 
 void process_setup_packets (  ) {
+	uint8_t dts;
 
-        if ( USTATbits.DIR == 0 ) {     // This is an OUT or a SETUP transaction
+	if ( USTATbits.DIR == 0 ) {     // This is an OUT or a SETUP transaction
 
-                unsigned char PID = ( Interfaces[0].Output.Stat & 0x3C ) >> 2;
+		unsigned char PID = Interfaces[0].Output.BDnSTAT.pid;
 
-                if ( PID == 0x0D ) {    // This is a SETUP packet
+		if ( PID == 0x0D ) {    // This is a SETUP packet
 
-                        // Recupere l'acces a la mémoire partagée
-                        Interfaces[0].Input.Stat &= ~UOWN;
-                        Interfaces[0].Output.Stat &= ~UOWN;
+			// Recupere l'acces a la mémoire partagée
+			// Clear UOWN & STALL
+			Interfaces[0].Input.BDnSTAT.value = 0;
+			Interfaces[0].Output.BDnSTAT.value = 0;
 
-                        Interfaces[0].Output.Cnt = 8;
-                        Interfaces[0].Input.Cnt = 0;
+			Interfaces[0].Output.BDnCNT = EP0_BUFLEN;
+			Interfaces[0].Input.BDnCNT = EP0_BUFLEN;
 
-                        SetupPacketStruct *SetupPacket;
-                        SetupPacket = ( SetupPacketStruct * ) EP0_OUTbuffer;
+			SetupPacketStruct *SetupPacket;
+			SetupPacket = ( SetupPacketStruct * ) ep_buffers.EP0_OUTbuffer;
 
-                        if ( SetupPacket->bmRequestType == 0x80 ) {     // Data will go from Device to host
+			if ( SetupPacket->bmRequestType == 0x80 ) {     // Data will go from Device to host
 
-                                if ( SetupPacket->bRequest == 0x06 ) {  // GET_DESCRIPTOR
+				if ( SetupPacket->bRequest == 0x06 ) {  // GET_DESCRIPTOR
 
-                                        switch ( SetupPacket->wValue1 ) {
+					switch ( SetupPacket->wValue1 ) {
 
-                                        case 0x01:     // Device Descriptor
+						case 0x01:     // Device Descriptor
 
-                                                addr_to_send =
-                                                    ( unsigned char * )
-                                                    DeviceDescriptor;
-                                                cnt_to_send =
-                                                    SetupPacket->wLength;
+							addr_to_send =
+								( unsigned char * )
+								DeviceDescriptor;
+							cnt_to_send =
+								SetupPacket->wLength;
 
-                                                fill_in_buffer (  );
-                                                UCONbits.PKTDIS = 0;
-                                                break;
+							fill_in_buffer (  );
+							break;
 
-                                        case 0x02:     // Configuration Descriptor
+						case 0x02:     // Configuration Descriptor
 
-                                                addr_to_send =
-                                                    ( unsigned char * )
-                                                    ConfigurationDescriptor;
-                                                cnt_to_send =
-                                                    SetupPacket->wLength;
+							addr_to_send =
+								( unsigned char * )
+								ConfigurationDescriptor;
+							cnt_to_send =
+								SetupPacket->wLength;
 
-                                                fill_in_buffer (  );
-                                                UCONbits.PKTDIS = 0;
-                                                break;
+							fill_in_buffer (  );
+							break;
 
-                                        case 0x03:     // String descriptor
-                                                addr_to_send =
-                                                    USBStringDescriptorsPtr
-                                                    [SetupPacket->wValue0];
-                                                cnt_to_send = *addr_to_send;
+						case 0x03:     // String descriptor
+							addr_to_send =
+								USBStringDescriptorsPtr
+								[SetupPacket->wValue0];
+							cnt_to_send = *addr_to_send;
 
-                                                fill_in_buffer (  );
-                                                UCONbits.PKTDIS = 0;
+							fill_in_buffer (  );
+							break;
 
-                                                break;
+						default:       // Inconnu: stall ep0
+							Interfaces[0].Output.BDnSTAT.value =
+								UOWN | BSTALL;
+							Interfaces[0].Input.BDnSTAT.value =
+								UOWN | BSTALL;
+							UCONbits.PKTDIS = 0;
+							return;
 
-                                        default:
+					}
+				}
 
-                                                Interfaces[0].Output.Stat =
-                                                    UOWN | BSTALL;
-                                                Interfaces[0].Input.Stat =
-                                                    UOWN | BSTALL;
-                                                UCONbits.PKTDIS = 0;
-                                                return;
-                                                break;
+				if ( SetupPacket->bRequest == 0x00 ) {  // GET_STATUS
 
-                                        }
-                                }
+					ep_buffers.EP0_INbuffer[0] = 0x00;
+					ep_buffers.EP0_INbuffer[1] = 0x00;
 
-                                if ( SetupPacket->bRequest == 0x00 ) {  // GET_STATUS
+					Interfaces[0].Input.BDnCNT = 2;
+				}
+			}
 
-                                        EP0_INbuffer[0] = 0x00;
-                                        EP0_INbuffer[1] = 0x00;
+			if ( SetupPacket->bmRequestType == 0x00 ) {     // data will go from Host to Device
 
-                                        Interfaces[0].Input.Cnt = 2;
+				switch ( SetupPacket->bRequest ) {
 
-                                        UCONbits.PKTDIS = 0;
+					case 0x05:     // SET ADDRESS
+						addresse = SetupPacket->wValue0;
 
-                                }
-                        }
+						break;
 
-                        if ( SetupPacket->bmRequestType == 0x00 ) {     // data will go from Host to Device
+					case 0x09:     // SET CONFIGURATION
+						setup_endpoints (  );
 
-                                switch ( SetupPacket->bRequest ) {
+						break;
 
-                                case 0x05:     // SET ADDRESS
-                                        addresse = SetupPacket->wValue0;
+					default:
+						break;
 
-                                        UCONbits.PKTDIS = 0;
+				}
 
-                                        break;
+			}
 
-                                case 0x09:     // SET CONFIGURATION
-                                        UCONbits.PKTDIS = 0;
+			// Rend l'acces mémoire au SIE
+			Interfaces[0].Output.BDnSTAT.value = UOWN | DTSEN;
+			Interfaces[0].Input.BDnSTAT.value  = UOWN | DTS | DTSEN;
 
-                                        setup_endpoints (  );
+			/* SETUP packet sets PKTDIS which disables
+			 * future SETUP packet reception. Turn it off
+			 * afer we've processed the current SETUP
+			 * packet to avoid a race condition. */
+			UCONbits.PKTDIS = 0;
+		}
 
-                                        break;
+	} else {                // This is an In packet
 
-                                default:
-                                        break;
+		if ( ( addresse != 0x00 ) && ( UADDR != addresse ) )
+			UADDR = addresse;
 
-                                }
+		fill_in_buffer (  );
+		dts = Interfaces[0].Input.BDnSTAT.dts;
+		Interfaces[0].Input.BDnSTAT.value = 0;	// Reset BDnSTAT before set
 
-                        }
-                        // Rend l'acces mémoire au SIE
-                        Interfaces[0].Output.Stat = UOWN | DTSEN;
-                        Interfaces[0].Input.Stat = UOWN | DTS | DTSEN;
-                }
+		/* NB: The firmware should not set the UOWN bit
+		   in the same instruction cycle as any other
+		   modifications to the BDnSTAT soft
+		   register. The UOWN bit should only be set
+		   in a separate instruction cycle, only after
+		   all other bits in BDnSTAT (and address/
+		   count registers) have been fully updated. */
+		if ( dts )
+			Interfaces[0].Input.BDnSTAT.value = UOWN | DTSEN;
+		else
+			Interfaces[0].Input.BDnSTAT.value = UOWN | DTS | DTSEN;
 
-        } else {                // This is an In packet
-
-                if ( ( addresse != 0x00 ) && ( UADDR != addresse ) )
-                        UADDR = addresse;
-
-                fill_in_buffer (  );
-
-                /*Interfaces[0].Input.Stat = DTSEN ;
-                   if (!Interfaces[0].Input.STAT.dts)
-                   Interfaces[0].Input.Stat |= DTS;
-                   Interfaces[0].Input.STAT.dts = 0;
-                   Interfaces[0].Input.STAT.uown = 1;
-                 */
-
-                // RQ: Need to set everything at once ?
-                if ( Interfaces[0].Input.STAT.dts )
-                        Interfaces[0].Input.Stat = UOWN | DTSEN;
-                else
-                        Interfaces[0].Input.Stat = UOWN | DTS | DTSEN;
-
-        }
+	}
 }
 
 void process_command_packets (  ) {
+	uint8_t dts;
 
-        if ( USTATbits.DIR == 0 ) {     // This is an OUT transaction
+	if ( USTATbits.DIR == 0 ) {     // This is an OUT transaction
 
-                if ( EP1_OUTbuffer[0] == 65 )
-                        __dev_state.green_led = LED_ON;
+		if ( ep_buffers.EP1_OUTbuffer[0] == 65 )
+			__dev_state.green_led = LED_ON;
 
-                if ( EP1_OUTbuffer[0] == 66 )
-                        __dev_state.green_led = LED_OFF;
+		if ( ep_buffers.EP1_OUTbuffer[0] == 66 )
+			__dev_state.green_led = LED_OFF;
 
-                if ( EP1_OUTbuffer[0] == 67 ) {
-                        set_all_leds ( 0 );
-                        __dev_state.green_led = LED_AUTO;
-                }
+		if ( ep_buffers.EP1_OUTbuffer[0] == 67 ) {
+			set_all_leds ( 0 );
+			__dev_state.green_led = LED_AUTO;
+		}
 
-                if ( EP1_OUTbuffer[1] == 65 )
-                        __dev_state.yellow_led = LED_ON;
+		if ( ep_buffers.EP1_OUTbuffer[1] == 65 )
+			__dev_state.yellow_led = LED_ON;
 
-                if ( EP1_OUTbuffer[1] == 66 )
-                        __dev_state.yellow_led = LED_OFF;
+		if ( ep_buffers.EP1_OUTbuffer[1] == 66 )
+			__dev_state.yellow_led = LED_OFF;
 
-                if ( EP1_OUTbuffer[1] == 67 ) {
-                        set_all_leds ( 0 );
-                        __dev_state.yellow_led = LED_AUTO;
-                }
+		if ( ep_buffers.EP1_OUTbuffer[1] == 67 ) {
+			set_all_leds ( 0 );
+			__dev_state.yellow_led = LED_AUTO;
+		}
 
-                if ( EP1_OUTbuffer[2] == 65 )
-                        __dev_state.red_led = LED_ON;
+		if ( ep_buffers.EP1_OUTbuffer[2] == 65 )
+			__dev_state.red_led = LED_ON;
 
-                if ( EP1_OUTbuffer[2] == 66 )
-                        __dev_state.red_led = LED_OFF;
+		if ( ep_buffers.EP1_OUTbuffer[2] == 66 )
+			__dev_state.red_led = LED_OFF;
 
-                if ( EP1_OUTbuffer[2] == 67 ) {
-                        set_all_leds ( 0 );
-                        __dev_state.red_led = LED_AUTO;
-                }
+		if ( ep_buffers.EP1_OUTbuffer[2] == 67 ) {
+			set_all_leds ( 0 );
+			__dev_state.red_led = LED_AUTO;
+		}
 
-                if ( EP1_OUTbuffer[3] == 65 ) {
+		Interfaces[1].Output.BDnCNT = EP1_BUFLEN;
 
-                        Interfaces[1].Input.Cnt = 8;
+		dts = Interfaces[1].Output.BDnSTAT.dts;
+		Interfaces[1].Output.BDnSTAT.value = 0;
 
-                        memcpy ( EP1_INbuffer, &__dev_state,
-                                 sizeof ( __dev_state ) );
+		if ( dts )
+			Interfaces[1].Output.BDnSTAT.value = UOWN | DTSEN;
+		else
+			Interfaces[1].Output.BDnSTAT.value = UOWN | DTS | DTSEN;
 
-                        Interfaces[1].Input.Stat = UOWN | DTS | DTSEN;
+	} else {
+		// Completed IN transaction: rearm for a next request.
+		// Don't change data.
+		dts = Interfaces[1].Input.BDnSTAT.dts;
+		Interfaces[1].Input.BDnSTAT.value = 0;
 
-                }
+		if ( dts )
+			Interfaces[1].Input.BDnSTAT.value = UOWN | DTSEN;
+		else
+			Interfaces[1].Input.BDnSTAT.value = UOWN | DTS | DTSEN;
 
-                Interfaces[1].Output.Cnt = 8;
-
-                if ( Interfaces[1].Output.Stat & DTS )
-                        Interfaces[1].Output.Stat = UOWN | DTSEN;
-                else
-                        Interfaces[1].Output.Stat = UOWN | DTS | DTSEN;
-
-        } else {                // This is an IN transaction
-
-                Interfaces[1].Input.Cnt = 8;
-
-                memcpy ( EP1_INbuffer, &__dev_state, sizeof ( __dev_state ) );
-
-                if ( Interfaces[1].Input.Stat & DTS )
-                        Interfaces[1].Input.Stat = UOWN | DTSEN;
-                else
-                        Interfaces[1].Input.Stat = UOWN | DTS | DTSEN;
-
-        }
+	}
 }
 
 void usb_interrupt_handler (  ) {
 
-        if ( !PIR2bits.USBIF )
-                return;
+	if ( !PIR2bits.USBIF )
+		return;
 
-        if ( UIRbits.TRNIF ) {  // Transaction complete
+#if defined( _USB_ERROR_INTERRUPT )
+	if ( UIRbits.UERRIF ) { // Detection d'erreur
+		if (UEIRbits.BTSEF) { // Bit Stuff Error Flag
+		}
+		if (UEIRbits.BTOEF) { // Bus Turnaround Time-out Error Flag
+		}
+		if (UEIRbits.DFN8EF) { // Data Field Size Error Flag
+		}
+		if (UEIRbits.CRC16EF) { //CRC16 Failure Flag
+		}
+		if (UEIRbits.CRC5EF) { // CRC5 Host Error Flag
+		}
+		if (UEIRbits.PIDEF) { // PID Check Failure Flag bit
+		}
+		UEIR = 0;
+	}
+#endif
 
-                switch ( USTATbits.ENDP ) {
-                case 0:
-                        process_setup_packets (  );
-                        break;  // EP0: Setup
-                case 1:
-                        process_command_packets (  );
-                        break;  // EP1: Command v1
-                default:
-                        break;
-                }
+	if ( UIRbits.TRNIF ) {  // Transaction complete
 
-                // Clear TRNIF, Advance USTAT FIFO
-                UIRbits.TRNIF = 0;
-        }
+		switch ( USTATbits.ENDP ) {
+			case 0:
+				process_setup_packets (  );
+				break;  // EP0: Setup
+			case 1:
+				process_command_packets (  );
+				break;  // EP1: Command v1
+			default:
+				break;
+		}
 
-        if ( UIRbits.SOFIF ) {  // Start of Frame ( not used )
+		// Clear TRNIF, Advance USTAT FIFO
+		//UIRbits.TRNIF = 0;
+	}
 
-                UIRbits.SOFIF = 0;
-        }
+#if 0
+	if ( UIRbits.SOFIF ) {  // Start of Frame ( not used )
 
-        if ( UIRbits.STALLIF ) {        // Stall
+		//UIRbits.SOFIF = 0;
+	}
+#endif
 
-                if ( UEP0bits.EPSTALL == 1 ) {
+	if ( UIRbits.STALLIF ) { // Stall
 
-                        Interfaces[0].Output.Cnt = 8;
-                        Interfaces[0].Output.Stat = UOWN | DTSEN;
+		if ( UEP0bits.EPSTALL == 1 ) {
 
-                        Interfaces[0].Input.Stat = 0x00;
+			Interfaces[0].Output.BDnCNT = EP0_BUFLEN;
+			Interfaces[0].Output.BDnSTAT.value = UOWN | DTSEN;
 
-                        UEP0bits.EPSTALL = 0;
-                }
+			Interfaces[0].Input.BDnSTAT.value = 0x00;
 
-                if ( UEP1bits.EPSTALL == 1 ) {
+			UEP0bits.EPSTALL = 0;
+		}
 
-                        set_green_led ( 0 );
-                        set_yellow_led ( 0 );
-                        set_red_led ( 1 );
+		if ( UEP1bits.EPSTALL == 1 ) {
 
-                        UEP1bits.EPSTALL = 0;
-                }
+			set_green_led ( 0 );
+			set_yellow_led ( 0 );
+			set_red_led ( 1 );
 
-                UIRbits.STALLIF = 0;
-        }
+			UEP1bits.EPSTALL = 0;
+		}
 
-        if ( UIRbits.URSTIF ) { // Reset
-                reset_usb (  );
-                UIRbits.URSTIF = 0;
-        }
+		//UIRbits.STALLIF = 0;
+	}
 
-        UIR = 0x00;
-        PIR2bits.USBIF = 0;
+	if ( UIRbits.URSTIF ) { // Reset
+		reset_usb (  );
+		//UIRbits.URSTIF = 0;
+	}
 
+	// Clear all bits;
+	UIR = 0x00;
+	PIR2bits.USBIF = 0;
 }
+
+unsigned char* usb_get_buffer () {
+	return &ep_buffers.EP1_INbuffer;
+}
+
+void usb_send_in_buffer (uint8_t ep, uint8_t len) {
+	Interfaces[1].Input.BDnCNT = len;
+
+	uint8_t dts = Interfaces[1].Input.BDnSTAT.dts;
+	Interfaces[1].Input.BDnSTAT.value = 0;
+	if (dts)
+		Interfaces[1].Input.BDnSTAT.value = UOWN | DTSEN;
+	else
+		Interfaces[1].Input.BDnSTAT.value = UOWN | DTS | DTSEN;
+}
+
+bool usb_in_endpoint_busy(uint8_t endpoint)
+{
+	return Interfaces[endpoint].Input.BDnSTAT.uown;
+}
+
+/* Local Variables:    */
+/* mode: c             */
+/* c-basic-offset: 8   */
+/* indent-tabs-mode: t */
+/* End:                */
