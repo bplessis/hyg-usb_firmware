@@ -6,9 +6,8 @@ PK2DEVPATH= /usr/share/pk2
 
 SOURCES = main.c usb.c leds.c i2c.c si7021A10.c
 CHIP = 16F1455
-EXEC = test
+EXEC = hygusb-firm
 
-CFLAGS =
 LDFLAGS =
 
 OBJS = $(SOURCES:.c=.p1)
@@ -40,4 +39,4 @@ pickit3: $(EXEC)
 	$(MDB) prog.cmd
 
 pickit2:
-	$(PK2CMD) -M -PPIC16F1455 -F$(EXEC).hex -B$(PK2DEVPATH)
+	$(PK2CMD) -M -PPIC${CHIP} -F$(EXEC).hex -B$(PK2DEVPATH)
