@@ -8,7 +8,6 @@
 
 void reset_usb (  );
 void usb_interrupt_handler (  );
-void usb_send_in_buffer (uint8_t ep, uint8_t len);
-unsigned char* usb_get_buffer ();
 bool usb_in_endpoint_busy(uint8_t ep);
+void usb_arm_in_transfert();
 #endif

@@ -128,7 +128,7 @@ void main ( void ) {
 		PIE2bits.USBIE = 0;     // Disable USB interrupt
 
 		// Measure data
-		measure_rh ( &__dev_state.hyg );
+		measure_rh   ( &__dev_state.hyg );
 		measure_temp ( &__dev_state.temp );
 
 		INTCONbits.PEIE = 1;    // Enable Peripheral interrupts
@@ -136,21 +136,10 @@ void main ( void ) {
 		PIE2bits.USBIE = 1;     // Enable USB interrupt
 
 		if (!usb_in_endpoint_busy(1)) {
-			// Update EP1 IN buffer with new datas.
-
-			unsigned char*buf =  usb_get_buffer();
-			memcpy ( buf, &__dev_state,
-				 EP1_BUFLEN /*sizeof ( __dev_state )*/ );
-
-			// Prepare response for next request
-			usb_send_in_buffer(1, EP1_BUFLEN);
-
-			__dev_state.yellow_led == LED_OFF;
-
-		} else {
-			__dev_state.yellow_led == LED_ON;
+			// Preset EP1 IN buffer with datas (really usefull only on boot, 
+                        // following rearming will happen in the USB Interrupt handler).
+                        usb_arm_in_transfert ();
 		}
-
 
 		if ( __dev_state.green_led == LED_AUTO )
 			toggle_green_led (  );

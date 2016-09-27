@@ -61,6 +61,8 @@ unsigned int cnt_to_send;
 
 unsigned char addresse;
 
+// Predecla
+
 
 /* Convert a pointer, which can be a normal banked pointer or a linear
  * pointer, to a linear pointer.
@@ -89,8 +91,6 @@ static unsigned int pic16_linear_addr(void *ptr)
 	       (low & 0x7f) - 0x20 +
 	       ((high << 1) + (low & 0x80)? 1: 0) * 0x50;
 }
-
-// Predecla
 
 void setup_endpoints (  ) {
 
@@ -131,17 +131,26 @@ void reset_usb (  ) {
 	UADDR = 0x00;           // Reset usb address
 
 	UIE = 0;		// Reset USB Interrupts
+
+#if defined(_USB_ERROR_INTERRUPT)
 	UIE = 0b00101011;	// Enable interrupts
 	//UIEbits.URSTIE = 1;	// USB Reset Interrupt
-	//UIEbits.UERRIE = 1;	// USB Reset Interrupt
+	//UIEbits.UERRIE = 1;	// USB Error Interrupt
 	//UIEbits.TRNIE  = 1;	// USB Transaction Complete
 	//UIEbits.IDLEIE = 0;	// USB IDLE Detect Interrupt
 	//UIEbits.STALLIE= 1;	// USB STALL Handshake Interrupt
 	//UIEbits.SOFIE  = 0;	// USB Start Of Frame
 
-#if defined(_USB_ERROR_INTERRUPT)
-	UEIE = 0x9f;		// ErrorInterrupt: BTSEE | BTOEE | DFN8EE | CRC16EE | CRC5EE | PIDEE
+	UEIE = 0b100111111;		// ErrorInterrupt: BTSEE | BTOEE | DFN8EE | CRC16EE | CRC5EE | PIDEE
 #else
+	UIE = 0b00101001;	// Enable interrupts
+	//UIEbits.URSTIE = 1;	// USB Reset Interrupt
+	//UIEbits.UERRIE = 0;	// USB Error Interrupt
+	//UIEbits.TRNIE  = 1;	// USB Transaction Complete
+	//UIEbits.IDLEIE = 0;	// USB IDLE Detect Interrupt
+	//UIEbits.STALLIE= 1;	// USB STALL Handshake Interrupt
+	//UIEbits.SOFIE  = 0;	// USB Start Of Frame
+
 	UEIE = 0x00;		// USB Error Interrupt: disabled
 #endif
 
@@ -393,28 +402,35 @@ void process_command_packets (  ) {
 			__dev_state.red_led = LED_AUTO;
 		}
 
-		Interfaces[1].Output.BDnCNT = EP1_BUFLEN;
+                if (!(Interfaces[1].Input.BDnSTAT.value & UOWN)) {
+                    usb_arm_in_transfert();
+                }
 
-		dts = Interfaces[1].Output.BDnSTAT.dts;
 		Interfaces[1].Output.BDnSTAT.value = 0;
-
-		if ( dts )
-			Interfaces[1].Output.BDnSTAT.value = UOWN | DTSEN;
-		else
-			Interfaces[1].Output.BDnSTAT.value = UOWN | DTS | DTSEN;
+		Interfaces[1].Output.BDnCNT = 0;
+		Interfaces[1].Output.BDnSTAT.value = UOWN | DTS | DTSEN;
 
 	} else {
 		// Completed IN transaction: rearm for a next request.
-		// Don't change data.
-		dts = Interfaces[1].Input.BDnSTAT.dts;
-		Interfaces[1].Input.BDnSTAT.value = 0;
+                usb_arm_in_transfert();
+        }
+}
 
-		if ( dts )
-			Interfaces[1].Input.BDnSTAT.value = UOWN | DTSEN;
-		else
-			Interfaces[1].Input.BDnSTAT.value = UOWN | DTS | DTSEN;
 
-	}
+void usb_arm_in_transfert() {
+        uint8_t dts;
+
+        Interfaces[1].Input.BDnCNT = sizeof (__dev_state);
+
+        memcpy ( ep_buffers.EP1_INbuffer, &__dev_state, sizeof ( __dev_state ) );
+
+        dts = Interfaces[1].Input.BDnSTAT.dts;
+	Interfaces[1].Input.BDnSTAT.value = 0;
+
+	if ( dts )
+		Interfaces[1].Input.BDnSTAT.value = UOWN | DTSEN;
+	else
+		Interfaces[1].Input.BDnSTAT.value = UOWN | DTS | DTSEN;
 }
 
 void usb_interrupt_handler (  ) {
@@ -496,26 +512,6 @@ void usb_interrupt_handler (  ) {
 	// Clear all bits;
 	UIR = 0x00;
 	PIR2bits.USBIF = 0;
-}
-
-unsigned char* usb_get_buffer () {
-	return &ep_buffers.EP1_INbuffer;
-}
-
-void usb_send_in_buffer (uint8_t ep, uint8_t len) {
-	Interfaces[1].Input.BDnCNT = len;
-
-	uint8_t dts = Interfaces[1].Input.BDnSTAT.dts;
-	Interfaces[1].Input.BDnSTAT.value = 0;
-	if (dts)
-		Interfaces[1].Input.BDnSTAT.value = UOWN | DTSEN;
-	else
-		Interfaces[1].Input.BDnSTAT.value = UOWN | DTS | DTSEN;
-}
-
-bool usb_in_endpoint_busy(uint8_t endpoint)
-{
-	return Interfaces[endpoint].Input.BDnSTAT.uown;
 }
 
 /* Local Variables:    */
